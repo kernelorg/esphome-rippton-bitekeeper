@@ -1,0 +1,696 @@
+# Optional LVGL debug UI for bitekeeper (Bite Cube receiver).
+#
+# Pages for a small landscape screen (designed for 240×135):
+#   Status   — receiver name and link, receiver battery, paired / online
+#              alarms, the last bite or drop-back; a round LED flashes red on
+#              a bite and yellow on a drop-back
+#   Alarms   — every paired alarm: battery, online, volume, tone, sensitivity
+#   Pair     — the paired receiver, receivers found nearby; Scan / Pair the
+#              strongest one / Forget
+#   Settings — flip the screen 180°, deep-sleep timeout
+#
+# Two buttons: the left one moves the focus to the next button, the right one
+# presses it. With the screen flipped the buttons swap roles, so "left" and
+# "right" stay where the user sees them.
+#
+# Deep sleep stops listening to the cube, so bites are missed while the board
+# sleeps: the default is "never". With a timeout, the device turns the
+# backlight off and enters deep sleep after the chosen time without a button
+# press or an alarm event; either button wakes it (configure the wakeup pins
+# in `deep_sleep:` of your device config).
+#
+# Include it with:
+#   packages:
+#     bitekeeper_ui: !include
+#       file: <path>/esphome-rippton-bitekeeper/ui/lvgl_debug.yaml
+#       vars:
+#         bitekeeper_id: cube_dev    # bitekeeper id
+#         display_id: lcd            # display driving LVGL
+#         rotation: "90"             # landscape rotation when not flipped
+#         key_left: btn_left         # binary_sensor of the left button
+#         key_right: btn_right       # binary_sensor of the right button
+#         backlight_id: backlight    # light switching the backlight
+#         deep_sleep_id: deep_sleep_ctl
+#
+# Requires bitekeeper, a display, a backlight light, two binary sensors and a
+# deep_sleep component (ESP32).
+
+defaults:
+  bitekeeper_id: cube_dev
+  display_id: lcd
+  rotation: "90"
+  key_left: btn_left
+  key_right: btn_right
+  backlight_id: backlight
+  deep_sleep_id: deep_sleep_ctl
+
+globals:
+  # ── persisted settings ──
+  - id: bk_ui_flip
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # Deep sleep after no activity: 0=30s 1=1m 2=3m 3=5m 4=never
+  - id: bk_ui_sleep_idx
+    type: uint8_t
+    restore_value: true
+    initial_value: '4'
+  # ── runtime ──
+  - id: bk_ui_last_act
+    type: uint32_t
+    initial_value: '0'
+  # Set while the button that woke the device is still held: ignored until
+  # released, so waking never clicks anything.
+  - id: bk_ui_swallow
+    type: bool
+    initial_value: 'false'
+
+# Logical keys for the LVGL keypad: physical buttons mapped by orientation,
+# silenced while the wake-up press is still held.
+binary_sensor:
+  - platform: template
+    id: bk_key_next
+    internal: true
+    lambda: |-
+      bool raw = id(bk_ui_flip) ? id(${key_right}).state : id(${key_left}).state;
+      return raw && !id(bk_ui_swallow);
+  - platform: template
+    id: bk_key_enter
+    internal: true
+    lambda: |-
+      bool raw = id(bk_ui_flip) ? id(${key_left}).state : id(${key_right}).state;
+      return raw && !id(bk_ui_swallow);
+
+script:
+  # Keypad focus: only the visible buttons of the page being shown.
+  - id: bk_ui_focus_page
+    parameters:
+      page: int
+    then:
+      - lambda: |-
+          lv_group_t *g = id(bk_ui_group);
+          lv_group_remove_all_objs(g);
+          lv_obj_t *pages[] = {id(bk_page_status)->obj, id(bk_page_alarms)->obj, id(bk_page_pair)->obj,
+                               id(bk_page_settings)->obj, id(bk_page_sleep)->obj};
+          lv_obj_t *p = pages[page % 5];
+          for (uint32_t i = 0; i < lv_obj_get_child_count(p); i++) {
+            lv_obj_t *c = lv_obj_get_child(p, (int32_t) i);
+            if (lv_obj_check_type(c, &lv_button_class) && !lv_obj_has_flag(c, LV_OBJ_FLAG_HIDDEN))
+              lv_group_add_obj(g, c);
+          }
+
+  # Orientation: base rotation, or +180° when flipped.
+  - id: bk_ui_apply_rotation
+    then:
+      - lambda: 'id(bk_lvgl)->set_rotation(${rotation} + (id(bk_ui_flip) ? 180 : 0));'
+
+  # Settings pages: highlight the current choice.
+  - id: bk_ui_mark_choices
+    then:
+      - lambda: |-
+          auto mark = [](lv_obj_t *o, bool on) {
+            if (on) lv_obj_add_state(o, LV_STATE_CHECKED);
+            else lv_obj_remove_state(o, LV_STATE_CHECKED);
+          };
+          lv_obj_t *slp[] = {id(bk_btn_slp0), id(bk_btn_slp1), id(bk_btn_slp2), id(bk_btn_slp3), id(bk_btn_slp4)};
+          for (int i = 0; i < 5; i++) mark(slp[i], i == id(bk_ui_sleep_idx));
+          static const char *SLP[5] = {"30s", "1m", "3m", "5m", "never"};
+          char b[40];
+          snprintf(b, sizeof(b), "Sleep after: %s >", SLP[id(bk_ui_sleep_idx) % 5]);
+          lv_label_set_text(id(bk_lbl_set_sleep), b);
+          lv_label_set_text(id(bk_lbl_set_flip), id(bk_ui_flip) ? "Flip screen: ON" : "Flip screen: OFF");
+
+  # Round LED on the Status page: red for 3 s after a bite, yellow after a
+  # drop-back, dim green while connected.
+  - id: bk_ui_led
+    then:
+      - lambda: |-
+          auto *bk = id(${bitekeeper_id});
+          lv_obj_t *led = id(bk_led);
+          uint32_t at = bk->last_event_ms();
+          if (at != 0 && millis() - at < 3000) {
+            bool on = ((millis() - at) / 250) % 2 == 0;
+            lv_led_set_color(led, bk->last_event_direction() == 0 ? lv_color_hex(0xFF2020) : lv_color_hex(0xFFC800));
+            lv_led_set_brightness(led, on ? 255 : 60);
+          } else if (bk->is_connected()) {
+            lv_led_set_color(led, lv_color_hex(0x2E7D32));
+            lv_led_set_brightness(led, 120);
+          } else {
+            lv_led_off(led);
+          }
+
+  # Refresh every label (1 s interval and on page load).
+  - id: bk_ui_refresh
+    then:
+      - lambda: |-
+          auto *bk = id(${bitekeeper_id});
+          char b[64];
+          // Status page.
+          snprintf(b, sizeof(b), "Bite Cube - %s",
+                   !bk->is_paired() ? "not paired" : bk->is_connected() ? "connected" : "searching");
+          lv_label_set_text(id(bk_lbl_title), b);
+          if (bk->is_paired())
+            snprintf(b, sizeof(b), "%s %d dBm", bk->paired_name().c_str(), bk->paired_rssi());
+          else
+            snprintf(b, sizeof(b), "Pair: Scan, then Pair");
+          lv_label_set_text(id(bk_lbl_cube), b);
+          const auto &rx = bk->receiver();
+          if (rx.mv_ema > 0)
+            snprintf(b, sizeof(b), "Rx %.2f V vol %u mode %u", rx.mv_ema / 1000.0f, rx.vol, rx.mode);
+          else
+            snprintf(b, sizeof(b), "Rx: no data yet");
+          lv_label_set_text(id(bk_lbl_rx), b);
+          auto paired = bk->paired_alarms();
+          unsigned online = 0;
+          for (uint8_t n : paired)
+            if (bk->slot(n - 1).online) online++;
+          snprintf(b, sizeof(b), "Alarms: %u paired, %u online", (unsigned) paired.size(), online);
+          lv_label_set_text(id(bk_lbl_alarms), b);
+          if (bk->last_event_alarm() == 0) {
+            snprintf(b, sizeof(b), "Last: nothing yet");
+          } else {
+            snprintf(b, sizeof(b), "Last: alarm %u %s, %us ago", bk->last_event_alarm(),
+                     bk->last_event_direction() == 0 ? "BITE" : "drop",
+                     (unsigned) ((millis() - bk->last_event_ms()) / 1000));
+          }
+          lv_label_set_text(id(bk_lbl_last), b);
+          snprintf(b, sizeof(b), "Events since boot: %u", (unsigned) bk->event_count());
+          lv_label_set_text(id(bk_lbl_count), b);
+
+          // Alarms page: one line per paired alarm.
+          lv_obj_t *rows[] = {id(bk_lbl_a0), id(bk_lbl_a1), id(bk_lbl_a2), id(bk_lbl_a3), id(bk_lbl_a4),
+                              id(bk_lbl_a5), id(bk_lbl_a6)};
+          for (size_t i = 0; i < 7; i++) {
+            if (i < paired.size()) {
+              uint8_t n = paired[i];
+              const auto &s = bk->slot(n - 1);
+              snprintf(b, sizeof(b), "%u: %.2f V %s vol %u tone %u sens %u", n, s.mv_ema / 1000.0f,
+                       s.online ? "on " : "off", s.vol, s.tone, s.sens);
+              lv_label_set_text(rows[i], b);
+            } else {
+              lv_label_set_text(rows[i], i == 0 && paired.empty() ? "no alarms paired yet" : "");
+            }
+          }
+
+          // Pair page.
+          lv_label_set_text(id(bk_lbl_p0), bk->is_paired() ? ("Paired: " + bk->paired_name()).c_str() : "Not paired");
+          lv_label_set_text(id(bk_lbl_p1), bk->is_paired() ? bk->paired_mac().c_str() : "Scan, wait, then Pair");
+          const auto &found = bk->scan_results();
+          lv_obj_t *res[] = {id(bk_lbl_p2), id(bk_lbl_p3), id(bk_lbl_p4)};
+          for (size_t i = 0; i < 3; i++) {
+            if (i < found.size()) {
+              snprintf(b, sizeof(b), "%s %d dBm", found[i].name.empty() ? found[i].mac.c_str() : found[i].name.c_str(),
+                       found[i].rssi);
+              lv_label_set_text(res[i], b);
+            } else {
+              lv_label_set_text(res[i], i == 0 ? "(no receivers found)" : "");
+            }
+          }
+
+lvgl:
+  id: bk_lvgl
+  displays:
+    - ${display_id}
+  rotation: ${rotation}
+  # No PSRAM on most ESP32 boards: a partial buffer is enough at this size.
+  buffer_size: 12%
+  keypads:
+    - group: bk_ui_group
+      next: bk_key_next
+      enter: bk_key_enter
+  # Keypad focus: a red frame stands out against the blue buttons. Keypad
+  # navigation sets FOCUS_KEY (outranks FOCUSED), where the default theme
+  # draws its blue outline — override both. Current choices are CHECKED.
+  theme:
+    button:
+      focused:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      focus_key:
+        outline_color: 0xFF2020
+        outline_width: 3
+        outline_pad: 1
+      checked:
+        bg_color: 0x2E7D32
+  style_definitions:
+    - id: bk_st_line
+      text_font: montserrat_12
+      width: 236
+    - id: bk_st_short
+      text_font: montserrat_12
+      width: 186
+  pages:
+    # ── Status ─────────────────────────────────────────────────────
+    - id: bk_page_status
+      on_load:
+        - script.execute: bk_ui_refresh
+        - script.execute:
+            id: bk_ui_focus_page
+            page: 0
+      widgets:
+        - label:
+            id: bk_lbl_title
+            x: 2
+            y: 0
+            styles: bk_st_short
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Bite Cube"
+        - label:
+            id: bk_lbl_cube
+            x: 2
+            y: 18
+            styles: bk_st_short
+            long_mode: dot
+            text: "-"
+        - label:
+            id: bk_lbl_rx
+            x: 2
+            y: 36
+            styles: bk_st_short
+            long_mode: dot
+            text: "-"
+        - label:
+            id: bk_lbl_alarms
+            x: 2
+            y: 54
+            styles: bk_st_line
+            long_mode: dot
+            text: "-"
+        - label:
+            id: bk_lbl_last
+            x: 2
+            y: 72
+            styles: bk_st_line
+            long_mode: dot
+            text: "-"
+        - label:
+            id: bk_lbl_count
+            x: 2
+            y: 90
+            styles: bk_st_line
+            long_mode: dot
+            text: "-"
+        - led:
+            id: bk_led
+            x: 194
+            y: 8
+            width: 40
+            height: 40
+            color: 0x2E7D32
+            brightness: 0%
+        - button:
+            x: 2
+            y: 110
+            width: 76
+            height: 24
+            widgets:
+              - label:
+                  text: "Alarms"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_alarms
+        - button:
+            x: 81
+            y: 110
+            width: 76
+            height: 24
+            widgets:
+              - label:
+                  text: "Pair"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_pair
+        - button:
+            x: 160
+            y: 110
+            width: 78
+            height: 24
+            widgets:
+              - label:
+                  text: ""
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_settings
+
+    # ── Alarms ─────────────────────────────────────────────────────
+    - id: bk_page_alarms
+      on_load:
+        - script.execute: bk_ui_refresh
+        - script.execute:
+            id: bk_ui_focus_page
+            page: 1
+      widgets:
+        - label:
+            id: bk_lbl_a0
+            x: 2
+            y: 0
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a1
+            x: 2
+            y: 15
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a2
+            x: 2
+            y: 30
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a3
+            x: 2
+            y: 45
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a4
+            x: 2
+            y: 60
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a5
+            x: 2
+            y: 75
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_a6
+            x: 2
+            y: 90
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_status
+
+    # ── Pair ───────────────────────────────────────────────────────
+    - id: bk_page_pair
+      on_load:
+        - script.execute: bk_ui_refresh
+        - script.execute:
+            id: bk_ui_focus_page
+            page: 2
+      widgets:
+        - label:
+            id: bk_lbl_p0
+            x: 2
+            y: 0
+            styles: bk_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "-"
+        - label:
+            id: bk_lbl_p1
+            x: 2
+            y: 15
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_p2
+            x: 2
+            y: 30
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_p3
+            x: 2
+            y: 45
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - label:
+            id: bk_lbl_p4
+            x: 2
+            y: 60
+            styles: bk_st_line
+            long_mode: dot
+            text: ""
+        - button:
+            x: 2
+            y: 80
+            width: 76
+            height: 24
+            widgets:
+              - label:
+                  text: "Scan"
+                  align: CENTER
+            on_click:
+              - bitekeeper.scan_clear: ${bitekeeper_id}
+              - script.execute: bk_ui_refresh
+        - button:
+            x: 81
+            y: 80
+            width: 76
+            height: 24
+            widgets:
+              - label:
+                  text: "Pair"
+                  align: CENTER
+            on_click:
+              - bitekeeper.pair: ${bitekeeper_id}
+              - script.execute: bk_ui_refresh
+        - button:
+            x: 160
+            y: 80
+            width: 78
+            height: 24
+            widgets:
+              - label:
+                  text: "Forget"
+                  align: CENTER
+            on_click:
+              - bitekeeper.forget: ${bitekeeper_id}
+              - script.execute: bk_ui_refresh
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_status
+
+    # ── Settings ───────────────────────────────────────────────────
+    - id: bk_page_settings
+      on_load:
+        - script.execute: bk_ui_mark_choices
+        - script.execute:
+            id: bk_ui_focus_page
+            page: 3
+      widgets:
+        - button:
+            x: 2
+            y: 2
+            width: 236
+            height: 28
+            widgets:
+              - label:
+                  id: bk_lbl_set_flip
+                  text: "Flip screen"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_flip) = !id(bk_ui_flip);'
+              - script.execute: bk_ui_apply_rotation
+              - script.execute: bk_ui_mark_choices
+        - button:
+            x: 2
+            y: 36
+            width: 236
+            height: 28
+            widgets:
+              - label:
+                  id: bk_lbl_set_sleep
+                  text: "Sleep after >"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_sleep
+        - label:
+            x: 2
+            y: 72
+            styles: bk_st_line
+            long_mode: dot
+            text: "Deep sleep stops listening to the cube:"
+        - label:
+            x: 2
+            y: 87
+            styles: bk_st_line
+            long_mode: dot
+            text: "bites are missed while asleep."
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Status"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_status
+
+    # ── Deep-sleep timeout ─────────────────────────────────────────
+    - id: bk_page_sleep
+      on_load:
+        - script.execute: bk_ui_mark_choices
+        - script.execute:
+            id: bk_ui_focus_page
+            page: 4
+      widgets:
+        - label:
+            x: 2
+            y: 0
+            styles: bk_st_line
+            long_mode: dot
+            text_color: 0x00C8FF
+            text: "Sleep after no activity"
+        - button:
+            id: bk_btn_slp0
+            x: 2
+            y: 18
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "30s"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_sleep_idx) = 0;'
+              - script.execute: bk_ui_mark_choices
+        - button:
+            id: bk_btn_slp1
+            x: 122
+            y: 18
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "1m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_sleep_idx) = 1;'
+              - script.execute: bk_ui_mark_choices
+        - button:
+            id: bk_btn_slp2
+            x: 2
+            y: 46
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "3m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_sleep_idx) = 2;'
+              - script.execute: bk_ui_mark_choices
+        - button:
+            id: bk_btn_slp3
+            x: 122
+            y: 46
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "5m"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_sleep_idx) = 3;'
+              - script.execute: bk_ui_mark_choices
+        - button:
+            id: bk_btn_slp4
+            x: 2
+            y: 74
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "Never"
+                  align: CENTER
+            on_click:
+              - lambda: 'id(bk_ui_sleep_idx) = 4;'
+              - script.execute: bk_ui_mark_choices
+        - label:
+            x: 122
+            y: 74
+            width: 116
+            text_font: montserrat_12
+            long_mode: wrap
+            text: "Wake: press either button"
+        - button:
+            x: 2
+            y: 110
+            width: 116
+            height: 24
+            widgets:
+              - label:
+                  text: "< Settings"
+                  align: CENTER
+            on_click:
+              - lvgl.page.show: bk_page_settings
+
+interval:
+  # Buttons: activity timestamp, swallow the wake-up press.
+  - interval: 20ms
+    then:
+      - lambda: |-
+          bool any = id(${key_left}).state || id(${key_right}).state;
+          static bool first = true;
+          if (first) {
+            first = false;
+            id(bk_ui_apply_rotation).execute();
+            // Woken by a button press: ignore it until it is released.
+            id(bk_ui_swallow) = any;
+          }
+          if (any)
+            id(bk_ui_last_act) = millis();
+          else
+            id(bk_ui_swallow) = false;
+
+  # LED flashing on bites / drop-backs.
+  - interval: 100ms
+    then:
+      - script.execute: bk_ui_led
+
+  - interval: 1s
+    then:
+      # An alarm event counts as activity: show it, do not sleep right after.
+      - lambda: |-
+          uint32_t at = id(${bitekeeper_id})->last_event_ms();
+          if (at != 0 && (int32_t) (at - id(bk_ui_last_act)) > 0)
+            id(bk_ui_last_act) = at;
+      # Deep sleep (screen off) after inactivity, unless set to "never".
+      - if:
+          condition:
+            lambda: |-
+              static const uint32_t SLEEP_S[4] = {30, 60, 180, 300};
+              uint8_t i = id(bk_ui_sleep_idx);
+              return i < 4 && millis() - id(bk_ui_last_act) >= SLEEP_S[i] * 1000u;
+          then:
+            - logger.log: "No activity for the sleep timeout - entering deep sleep"
+            - light.turn_off: ${backlight_id}
+            - deep_sleep.enter: ${deep_sleep_id}
+      - script.execute: bk_ui_refresh

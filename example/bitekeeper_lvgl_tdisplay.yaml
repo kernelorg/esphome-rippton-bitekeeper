@@ -1,0 +1,155 @@
+# Bite Cube debug firmware for a LilyGO T-Display (ESP32, ST7789 240×135):
+# bitekeeper + the optional LVGL debug UI (ui/lvgl_debug.yaml). No Wi-Fi —
+# the receiver is reached over BLE only; logs go over USB.
+#
+# First run: Pair page → Scan, wait a few seconds, Pair (the strongest
+# receiver found). The pairing is stored. A bite flashes the round LED red on
+# the Status page, a drop-back yellow.
+#
+# Buttons: left = next button, right = press (they swap with the screen
+# flipped, so they always match what you see).
+
+substitutions:
+  device_name: bitekeeper-debug
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # - source: github://kernelorg/esphome-rippton-bitekeeper@main
+    components:
+      - bitekeeper
+
+packages:
+  bitekeeper_ui: !include
+    file: ../ui/lvgl_debug.yaml
+    vars:
+      bitekeeper_id: cube_dev
+      display_id: lcd
+      rotation: "90"            # landscape; the Settings page can flip it 180°
+      key_left: btn_left
+      key_right: btn_right
+      backlight_id: backlight
+      deep_sleep_id: deep_sleep_ctl
+
+esphome:
+  name: ${device_name}
+  on_boot:
+    priority: 600
+    then:
+      # Release the backlight pin held low during deep sleep.
+      - lambda: 'gpio_hold_dis(GPIO_NUM_4);'
+  on_shutdown:
+    then:
+      # Before deep sleep: keep the backlight transistor off (GPIO4 would
+      # otherwise float and the backlight may glow).
+      - lambda: |-
+          gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+          gpio_set_level(GPIO_NUM_4, 0);
+          gpio_hold_en(GPIO_NUM_4);
+          gpio_deep_sleep_hold_en();
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  logs:
+    esp32_ble_tracker: WARN
+    esp32_ble_client: WARN
+    component: ERROR
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+    interval: 1100ms
+    window: 80ms
+    continuous: false
+
+ble_client:
+  - id: cube
+    mac_address: 00:00:00:00:00:00   # replaced at runtime by the stored pairing
+    auto_connect: true
+
+bitekeeper:
+  id: cube_dev
+  ble_client_id: cube
+  on_bite:
+    - logger.log:
+        format: "BITE on alarm %u"
+        args:
+          - 'alarm'
+  on_drop:
+    - logger.log:
+        format: "Drop-back on alarm %u"
+        args:
+          - 'alarm'
+  on_alarms_change:
+    - logger.log:
+        format: "Paired alarms: %u"
+        args:
+          - 'count'
+
+# ── Deep sleep (off by default in the UI): woken by either button. ─────
+deep_sleep:
+  id: deep_sleep_ctl
+  # Left button (GPIO0): ext0, wake while the pin is low.
+  wakeup_pin:
+    number: GPIO0
+    inverted: true
+    allow_other_uses: true
+    mode:
+      input: true
+      pullup: true
+  # Right button (GPIO35): ext1, ALL_LOW with a single pin = wake when low.
+  esp32_ext1_wakeup:
+    pins:
+      - number: GPIO35
+        allow_other_uses: true
+    mode: ALL_LOW
+
+# ── T-Display hardware ─────────────────────────────────────────────────
+spi:
+  clk_pin: GPIO18
+  mosi_pin: GPIO19
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: T-DISPLAY
+    reset_pin: GPIO23
+
+output:
+  - platform: ledc
+    id: backlight_out
+    pin: GPIO4
+
+light:
+  - platform: monochromatic
+    id: backlight
+    output: backlight_out
+    restore_mode: ALWAYS_ON
+    internal: true
+    default_transition_length: 0s
+
+binary_sensor:
+  - platform: gpio
+    id: btn_left
+    pin:
+      number: GPIO0
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
+        pullup: true
+  - platform: gpio
+    id: btn_right
+    # GPIO35 is input-only with an external pull-up on the T-Display.
+    pin:
+      number: GPIO35
+      inverted: true
+      allow_other_uses: true
+      mode:
+        input: true
